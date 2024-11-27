@@ -7,8 +7,12 @@ const { exec } = require('child_process');
 const DEFAULT_SETTINGS = {
     source_folder: "",
     target_folder: "",
-    autoGit: false, // 添加新的设置项默认值为 false
-    gitPushBranch: "main" // 新增设置项，默认推送分支为main，可根据实际修改
+    // 自动推送，项默认值为 false
+    autoGit: false, 
+    // 新增设置项，默认推送分支为main，可根据实际修改
+    gitPushBranch: "main", 
+    // 文件严格匹配，如果hexo文件夹出现了别的md会删除(同步删除操作)
+    enableFolderMatching: false
 };
 
 // 插件主体
@@ -86,16 +90,25 @@ module.exports = class MyPlugin extends Plugin {
                     }
                 }
             }
+
+            let hasDeletedFiles = false;
+            // 执行匹配删除多余文件操作（如果配置开启），并记录是否有文件删除
+            if (this.settings.enableFolderMatching) {
+                hasDeletedFiles = await this.matchAndDeleteExtraFiles(source, target);
+            }
+
             if (copiedFiles.length > 0) {
                 new Notice("复制了以下文件：");
-                for (const file of copiedFiles) {
-                    new Notice(`${file}`);
-                    }
-                if (this.settings.autoGit) {
-                    await this.autoPushToHexo();
+                copiedFiles.forEach(file => new Notice(`${file}`));
+            } else {
+                if (copiedFiles.length === 0) {
+                    new Notice("没有新的文件需要复制。");
                 }
-            } else if(copiedFiles.length == 0) {
-                new Notice("没有新的文件需要复制。");
+            }
+
+            // 有文件复制或者有文件删除且配置了自动推送时，执行自动推送到Hexo操作
+            if (this.settings.autoGit && (copiedFiles.length > 0 || hasDeletedFiles)) {
+                await this.autoPushToHexo();
             }
         } catch (error) {
             new Notice(`文件复制出现错误: ${error.message}`);
@@ -141,6 +154,40 @@ module.exports = class MyPlugin extends Plugin {
             });
         });
     }
+
+    // 新封装的方法，用于匹配并删除目标文件夹中多余的.md文件
+async matchAndDeleteExtraFiles(sourceFolder, targetFolder) {
+    let deletedFilesCount = 0;
+    let deletedFiles = []; // 新增数组，用于记录被删除的文件列表
+    // 获取目标文件夹中的所有.md 文件
+    const targetFiles = await fs.readdir(targetFolder);
+    const targetMdFiles = targetFiles.filter(file => path.extname(file) === '.md');
+    // 遍历目标文件夹中的.md 文件
+    for (const targetFile of targetMdFiles) {
+        const targetFilePath = path.join(targetFolder, targetFile);
+        const sourceFilePath = path.join(sourceFolder, targetFile);
+        try {
+            // 判断源文件夹中是否存在该文件
+            const exists = await fs.access(sourceFilePath).then(() => true).catch(() => false);
+            if (!exists) {
+                // 如果源文件夹中不存在该文件，则删除目标文件夹中的文件，并记录已删除文件数量和文件名
+                await fs.unlink(targetFilePath);
+                deletedFilesCount++;
+                deletedFiles.push(targetFile);
+            }
+        } catch (error) {
+            console.error("在判断或删除文件", targetFile, "时出现错误:", error);
+            new Notice(`在处理文件 ${targetFile} 时出现错误: ${error.message}`);
+        }
+    }
+    if (deletedFilesCount > 0) {
+        new Notice("发现多余文件，已删除以下文件：");
+        deletedFiles.forEach(file => new Notice(`${file}`)); // 遍历并展示被删除的文件名列表
+        return true;
+    }
+    return false;
+}
+
 };
 
 // 设置面板
@@ -209,5 +256,17 @@ class MySettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     })
             );
+
+            //严格匹配
+            new Setting(containerEl)
+            .setName("严格模式")
+            .setDesc("开启后会进行目标文件夹与当前文件夹匹配操作，删除多余的.md 文件")
+            .addToggle((toggle) => {
+                 toggle.setValue(this.plugin.settings.enableFolderMatching);
+                 toggle.onChange(async (value) => {
+                     this.plugin.settings.enableFolderMatching = value;
+                     await this.plugin.saveSettings();
+                 });
+             });
     }
 }
