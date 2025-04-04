@@ -1,43 +1,38 @@
-const { Plugin, PluginSettingTab, Setting, Notice, getIcon } = require('obsidian');
-const fs = require('fs').promises; // 使用promises版本，便于使用async/await
-const path = require('path');
-const { exec } = require('child_process');
+const { Plugin, PluginSettingTab, Setting, Notice } = require('obsidian');
+const fs = require('node:fs').promises;
+const path = require('node:path');
+const { exec } = require('node:child_process');
 
-// 设置默认值
 const DEFAULT_SETTINGS = {
     source_folder: "",
-    target_folder: "",
-    // 自动推送，项默认值为 false
-    autoGit: false, 
-    // 新增设置项，默认推送分支为main，可根据实际修改
-    gitPushBranch: "main", 
-    // 文件严格匹配，如果hexo文件夹出现了别的md会删除(同步删除操作)
-    enableFolderMatching: false
+    blogs: [
+        {
+            name: "默认博客",
+            target_folder: "",
+            autoGit: false,
+            gitPushBranch: "main",
+            enableFolderMatching: false,
+            autoSlug: false,
+            slugPrefix: "",
+            slugSuffix: "",
+            slugSeparator: "-"
+        }
+    ]
 };
 
-// 插件主体
-module.exports = class MyPlugin extends Plugin {
+module.exports = class MultiBlogPublisher extends Plugin {
     async onload() {
-        // 加载配置文件
         await this.loadSettings();
 
-        // 添加按钮
         this.addRibbonIcon("clipboard-paste", "笔记推送", async () => {
             await this.copyMarkdownFiles();
         });
 
-        // 添加配置面板
-        this.addSettingTab(new MySettingTab(this.app, this));
+        this.addSettingTab(new MultiBlogSettingTab(this.app, this));
     }
 
-    onunload() {}
-
     async loadSettings() {
-        this.settings = Object.assign(
-            {},
-            DEFAULT_SETTINGS,
-            await this.loadData()
-        );
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     }
 
     async saveSettings() {
@@ -45,153 +40,194 @@ module.exports = class MyPlugin extends Plugin {
     }
 
     async copyMarkdownFiles() {
-        // 第一个是相对路径 
-        const basePath = this.app.vault.adapter.basePath;
-        const source = path.join(basePath, this.settings.source_folder);
-        const target = this.settings.target_folder;
+        const vaultPath = this.app.vault.adapter.basePath;
+        const sourceRelative = this.settings.source_folder;
+        const source = sourceRelative ? path.join(vaultPath, sourceRelative) : "";
 
-        // 检查源文件夹和目标文件夹路径是否设置，修正条件判断逻辑
-        if (source === "" || target === "") {
-            new Notice("请先设置源文件夹和目标文件夹路径");
+        if (!this.settings.source_folder || this.settings.blogs.length === 0) {
+            new Notice("请先设置源文件夹和至少一个博客配置");
             return;
         }
+        try {
+            await fs.access(source); // 检查路径是否存在
+            const files = await fs.readdir(source);
+            const mdFiles = files.filter(file => path.extname(file).toLowerCase() === '.md');
 
-        // 判断文件夹是否正确
-        if (!await fs.access(target).then(() => true).catch(() => false)) {
-            new Notice(`目标文件夹不存在，请确认路径是否正确。`);
-            return;
+            if (mdFiles.length === 0) {
+                new Notice("源文件夹中没有Markdown文件");
+                return;
+            }
+            await this.processBlogPushes();
+        } catch (error) {
+            new Notice(`文件处理出错: ${error.message}`);
+            console.error(error);
         }
+    }
+
+    async processBlogPushes() {
+        const vaultPath = this.app.vault.adapter.basePath;
+        const sourceRelative = this.settings.source_folder;
+        const source = sourceRelative ? path.join(vaultPath, sourceRelative) : "";
 
         try {
             const files = await fs.readdir(source);
-            let copiedFiles = [];
-            for (const file of files) {
-                const filePath = path.join(source, file);
-                const fileStats = await fs.stat(filePath);
-                if (fileStats.isFile() && path.extname(file) === '.md') {
-                    const targetFilePath = path.join(target, file);
-                    try {
-                        // 判断目标文件夹中是否已存在该文件并获取其状态
-                        const targetStat = await fs.stat(targetFilePath);
-                        // 比较文件的修改时间，只有源文件修改时间更新才复制
-                        if (fileStats.mtimeMs > targetStat.mtimeMs) {
-                            await fs.copyFile(filePath, targetFilePath);
-                            copiedFiles.push(file);
-                        }
-                    } catch (error) {
-                        if (error.code === 'ENOENT') {
-                            // 文件不存在则直接复制
-                            await fs.copyFile(filePath, targetFilePath);
-                            copiedFiles.push(file);
+            const mdFiles = files.filter(file => path.extname(file).toLowerCase() === '.md');
+
+            if (mdFiles.length === 0) {
+                new Notice("源文件夹中没有Markdown文件");
+                return;
+            }
+            let resultMessage = "文件推送结果:\n\n";
+
+            for (const blog of this.settings.blogs) {
+                if (!blog.target_folder) continue;
+
+                // 目标路径直接使用用户输入的绝对路径
+                const target = blog.target_folder;
+                let blogMessage = `博客【${blog.name}】:\n`;
+                let fileCount = 0;
+
+                try {
+                    await fs.mkdir(target, { recursive: true });
+
+                    for (const file of mdFiles) {
+                        const sourcePath = path.join(source, file);
+                        const targetFilename = this.generateSlugFilename(file, blog);
+                        const targetPath = path.join(target, targetFilename);
+
+                        // 确保目标目录存在
+                        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+
+                        await fs.copyFile(sourcePath, targetPath);
+
+                        const originalFilename = path.basename(file);
+                        const newFilename = path.basename(targetPath);
+
+                        if (originalFilename !== newFilename) {
+                            blogMessage += `- ${originalFilename} → ${newFilename}\n`;
                         } else {
-                            // 其他错误情况处理
-                            throw error;
+                            blogMessage += `- ${originalFilename}\n`;
+                        }
+
+                        fileCount++;
+
+                        if (blog.autoSlug) {
+                            await this.processFileSlug(targetPath, blog);
                         }
                     }
+
+                    blogMessage += `共推送 ${fileCount} 个文件\n\n`;
+
+                    if (blog.autoGit) {
+                        try {
+                            await this.autoPushToBlog(target, blog.gitPushBranch);
+                            blogMessage += "✅ 自动Git推送完成\n";
+                        } catch (gitError) {
+                            blogMessage += `❌ Git推送失败: ${gitError.message}\n`;
+                        }
+                    }
+
+                    if (blog.enableFolderMatching) {
+                        const deletedFiles = await this.matchAndDeleteExtraFiles(source, target);
+                        if (deletedFiles.length > 0) {
+                            blogMessage += `🗑️ 删除多余文件: ${deletedFiles.join(', ')}\n`;
+                        }
+                    }
+
+                    resultMessage += blogMessage;
+                } catch (error) {
+                    resultMessage += `处理博客 ${blog.name} 出错: ${error.message}\n`;
+                    console.error(`处理博客 ${blog.name} 出错:`, error);
                 }
             }
 
-            let hasDeletedFiles = false;
-            // 执行匹配删除多余文件操作（如果配置开启），并记录是否有文件删除
-            if (this.settings.enableFolderMatching) {
-                hasDeletedFiles = await this.matchAndDeleteExtraFiles(source, target);
-            }
-
-            if (copiedFiles.length > 0) {
-                new Notice("复制了以下文件：");
-                copiedFiles.forEach(file => new Notice(`${file}`));
-            } else {
-                if (copiedFiles.length === 0) {
-                    new Notice("没有新的文件需要复制。");
-                }
-            }
-
-            // 有文件复制或者有文件删除且配置了自动推送时，执行自动推送到Hexo操作
-            if (this.settings.autoGit && (copiedFiles.length > 0 || hasDeletedFiles)) {
-                await this.autoPushToHexo();
-            }
+            new Notice(resultMessage, 15000); // 15秒后自动关闭
         } catch (error) {
-            new Notice(`文件复制出现错误: ${error.message}`);
+            new Notice(`推送处理出错: ${error.message}`);
+            console.error("推送处理出错:", error);
         }
     }
 
-    // 自动推送到Hexo
-    async autoPushToHexo() {
-        const hexoProjectPath = this.settings.target_folder;
-        if (!hexoProjectPath) {
-            new Notice("未找到Hexo项目路径，请检查配置。");
-            return;
-        }
-        try {
-            // 进入Hexo项目目录
-            process.chdir(hexoProjectPath);
-
-            // 1. 添加所有文件变更到Git暂存区
-            await this.executeCommand('git add .');
-
-            // 2. 提交变更，这里提交信息简单写为 "Auto update from Obsidian"，你可按需修改
-            await this.executeCommand('git commit -m "Auto update from Obsidian"');
-
-            // 3. 推送变更到远程仓库，使用设置中的分支名称
-            const branch = this.settings.gitPushBranch;
-            await this.executeCommand(`git push origin ${branch}`);
-            new Notice("已成功将文件推送到Hexo。");
-        } catch (error) {
-            const errorMessage = `自动推送到Hexo出现错误: ${error.message}，详细错误信息: ${error.stderr}`;
-            new Notice(errorMessage);
-        }
-    }
-
-    async executeCommand(command) {
+    async autoPushToBlog(targetFolder, branch = "main") {
         return new Promise((resolve, reject) => {
-            exec(command, (error, stdout, stderr) => {
+            const commands = [
+                `cd "${targetFolder}"`,
+                'git add .',
+                `git commit -m "自动提交: ${new Date().toLocaleString()}"`,
+                `git push origin ${branch}`
+            ].join(' && ');
+
+            exec(commands, (error, stdout, stderr) => {
                 if (error) {
-                    const errorMessage = `执行命令 "${command}" 出错: ${error.message}，详细错误信息: ${stderr}`;
-                    reject(new Error(errorMessage));
+                    console.error('Git推送错误:', stderr);
+                    reject(new Error(stderr || 'Git推送失败'));
                 } else {
-                    resolve(stdout);
+                    console.log('Git推送成功:', stdout);
+                    resolve();
                 }
             });
         });
     }
 
-    // 新封装的方法，用于匹配并删除目标文件夹中多余的.md文件
-async matchAndDeleteExtraFiles(sourceFolder, targetFolder) {
-    let deletedFilesCount = 0;
-    let deletedFiles = []; // 新增数组，用于记录被删除的文件列表
-    // 获取目标文件夹中的所有.md 文件
-    const targetFiles = await fs.readdir(targetFolder);
-    const targetMdFiles = targetFiles.filter(file => path.extname(file) === '.md');
-    // 遍历目标文件夹中的.md 文件
-    for (const targetFile of targetMdFiles) {
-        const targetFilePath = path.join(targetFolder, targetFile);
-        const sourceFilePath = path.join(sourceFolder, targetFile);
+    // 处理文件内容中的slug
+    async processFileSlug(filePath, blog) {
         try {
-            // 判断源文件夹中是否存在该文件
-            const exists = await fs.access(sourceFilePath).then(() => true).catch(() => false);
-            if (!exists) {
-                // 如果源文件夹中不存在该文件，则删除目标文件夹中的文件，并记录已删除文件数量和文件名
-                await fs.unlink(targetFilePath);
-                deletedFilesCount++;
-                deletedFiles.push(targetFile);
+            let content = await fs.readFile(filePath, 'utf8');
+
+            // 这里可以根据你的需求修改文件内容
+            // 例如添加front matter中的slug字段
+            if (content.startsWith('---')) {
+                const frontMatterEnd = content.indexOf('\n---', 3);
+                if (frontMatterEnd > 0) {
+                    const frontMatter = content.slice(0, frontMatterEnd + 4);
+                    const body = content.slice(frontMatterEnd + 4);
+
+                    // 如果已经有slug字段则跳过
+                    if (!frontMatter.includes('\nslug:')) {
+                        const slugValue = path.basename(filePath, path.extname(filePath));
+                        const newFrontMatter = frontMatter.replace(
+                            '---',
+                            `---\nslug: "${slugValue}"`
+                        );
+                        content = newFrontMatter + body;
+                    }
+                }
             }
+
+            await fs.writeFile(filePath, content);
         } catch (error) {
-            console.error("在判断或删除文件", targetFile, "时出现错误:", error);
-            new Notice(`在处理文件 ${targetFile} 时出现错误: ${error.message}`);
+            console.error(`处理文件slug出错: ${filePath}`, error);
         }
     }
-    if (deletedFilesCount > 0) {
-        new Notice("发现多余文件，已删除以下文件：");
-        deletedFiles.forEach(file => new Notice(`${file}`)); // 遍历并展示被删除的文件名列表
-        return true;
-    }
-    return false;
-}
 
+    // 修改后的matchAndDeleteExtraFiles返回删除的文件列表
+    async matchAndDeleteExtraFiles(sourceFolder, targetFolder) {
+        const deletedFiles = [];
+        try {
+            const sourceFiles = await fs.readdir(sourceFolder);
+            const targetFiles = await fs.readdir(targetFolder);
+
+            const sourceMdFiles = sourceFiles.filter(file => path.extname(file) === '.md');
+            const targetMdFiles = targetFiles.filter(file => path.extname(file) === '.md');
+
+            for (const file of targetMdFiles.filter(f => !sourceMdFiles.includes(f))) {
+                await fs.unlink(path.join(targetFolder, file));
+                deletedFiles.push(file);
+            }
+        } catch (error) {
+            console.error("删除文件出错:", error);
+        }
+        return deletedFiles;
+    }
+
+    // 生成带有slug的文件名，这里简单返回原文件名，你可以根据需要修改
+    generateSlugFilename(file, blog) {
+        return file;
+    }
 };
 
-// 设置面板
-class MySettingTab extends PluginSettingTab {
+
+class MultiBlogSettingTab extends PluginSettingTab {
     constructor(app, plugin) {
         super(app, plugin);
         this.plugin = plugin;
@@ -201,72 +237,200 @@ class MySettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
+        // 添加CSS样式
+        containerEl.createEl('style', { text: `
+           .blog-config {
+                background: var(--background-secondary);
+                border-radius: 8px;
+                padding: 16px;
+                margin-bottom: 16px;
+                border: 1px solid var(--background-modifier-border);
+                position: relative;
+            }
+           .blog-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 12px;
+            }
+           .blog-actions {
+                display: flex;
+                gap: 8px;
+            }
+           .delete-blog {
+                color: var(--text-error);
+            }
+           .setting-item {
+                padding: 8px 0;
+            }
+        ` });
+
+        containerEl.createEl('h2', { text: '多博客发布设置' });
+
         new Setting(containerEl)
-          .setName("源文件夹")
-          .setDesc("本地路径（相对路径）")
-          .addText((text) =>
-                text
-                  .setPlaceholder("输入文件夹路径(相对路径)")
-                  .setValue(this.plugin.settings.source_folder)
-                  .onChange(async (value) => {
+           .setName('源文件夹')
+           .setDesc('相对路径，相对于Obsidian仓库根目录，例如: _posts')
+           .addText(text => {
+                text.setPlaceholder('_posts')
+                   .setValue(this.plugin.settings.source_folder)
+                   .onChange(async (value) => {
                         this.plugin.settings.source_folder = value;
                         await this.plugin.saveSettings();
-                    })
-            );
-
-        new Setting(containerEl)
-          .setName("目标文件夹")
-          .setDesc("博客所在文件夹（绝对路径）")
-          .addText((text) =>
-                text
-                  .setPlaceholder("输入文件夹路径")
-                  .setValue(this.plugin.settings.target_folder)
-                  .onChange(async (value) => {
-                        this.plugin.settings.target_folder = value;
-                        await this.plugin.saveSettings();
-                    })
-            );
-
-        // 自动推送开关设置
-        new Setting(containerEl)
-          .setName("开启自动推送")
-          .setDesc("自动推送到Hexo")
-          .addToggle((toggle) => {
-                toggle.setValue(this.plugin.settings.autoGit);
-                toggle.onChange(async (value) => {
-                    this.plugin.settings.autoGit = value;
-                    await this.plugin.saveSettings();
-                });
+                    });
             });
 
-        // 新增设置，用于输入git推送的分支名称
-        new Setting(containerEl)
-          .setName("Git推送分支")
-          .setDesc("设置自动推送时git push的目标分支")
-          .addText((text) =>
-                text
-                  .setPlaceholder("输入分支名称，如main或master等")
-                  .setValue(this.plugin.settings.gitPushBranch)
-                  .onChange(async (value) => {
-                        if (value.trim() === "") {
-                            new Notice("请输入有效的分支名称");
-                            return;
-                        }
-                        this.plugin.settings.gitPushBranch = value;
-                        await this.plugin.saveSettings();
-                    })
-            );
+        containerEl.createEl('h3', { text: '博客配置' });
 
-            //严格匹配
-            new Setting(containerEl)
-            .setName("严格模式")
-            .setDesc("开启后会进行目标文件夹与当前文件夹匹配操作，删除多余的.md 文件")
-            .addToggle((toggle) => {
-                 toggle.setValue(this.plugin.settings.enableFolderMatching);
-                 toggle.onChange(async (value) => {
-                     this.plugin.settings.enableFolderMatching = value;
-                     await this.plugin.saveSettings();
-                 });
-             });
+        new Setting(containerEl)
+           .setName('添加新博客')
+           .addButton(button => {
+                button.setButtonText('+ 添加博客')
+                   .setCta()
+                   .onClick(async () => {
+                        this.plugin.settings.blogs.push({
+                            name: `博客${this.plugin.settings.blogs.length + 1}`,
+                            target_folder: "",
+                            autoGit: false,
+                            gitPushBranch: "main",
+                            enableFolderMatching: false,
+                            autoSlug: false,
+                            slugPrefix: "",
+                            slugSuffix: "",
+                            slugSeparator: "-"
+                        });
+                        await this.plugin.saveSettings();
+                        this.display();
+                    });
+            });
+
+        this.plugin.settings.blogs.forEach((blog, index) => {
+            const blogDiv = containerEl.createEl('div', { cls: 'blog-config' });
+
+            // 博客标题和删除按钮
+            const header = blogDiv.createEl('div', { cls: 'blog-header' });
+            header.createEl('h3', { text: blog.name });
+
+            const actions = header.createEl('div', { cls: 'blog-actions' });
+
+            // 删除按钮
+            new Setting(actions)
+               .addButton(button => {
+                    button.setButtonText('删除')
+                       .setClass('delete-blog')
+                       .onClick(async () => {
+                            this.plugin.settings.blogs.splice(index, 1);
+                            await this.plugin.saveSettings();
+                            this.display();
+                        });
+                });
+
+            new Setting(blogDiv)
+               .setName('博客名称')
+               .addText(text => {
+                    text.setValue(blog.name)
+                       .onChange(async (value) => {
+                            this.plugin.settings.blogs[index].name = value;
+                            await this.plugin.saveSettings();
+                            this.display(); // 刷新显示以更新标题
+                        });
+                });
+
+            new Setting(blogDiv)
+               .setName('目标文件夹')
+               .setDesc('绝对路径，例如: F:\\Blog\\target\\posts')
+               .addText(text => {
+                    text.setPlaceholder('F:\\Blog\\target\\posts')
+                       .setValue(blog.target_folder)
+                       .onChange(async (value) => {
+                            this.plugin.settings.blogs[index].target_folder = value;
+                            await this.plugin.saveSettings();
+                        });
+                });
+
+            new Setting(blogDiv)
+               .setName('自动Git推送')
+               .setDesc('推送后自动提交并推送到Git仓库')
+               .addToggle(toggle => {
+                    toggle.setValue(blog.autoGit)
+                       .onChange(async (value) => {
+                            this.plugin.settings.blogs[index].autoGit = value;
+                            await this.plugin.saveSettings();
+                            this.display();
+                        });
+                });
+
+            if (blog.autoGit) {
+                new Setting(blogDiv)
+                   .setName('Git推送分支')
+                   .addText(text => {
+                        text.setPlaceholder('例如: main')
+                           .setValue(blog.gitPushBranch)
+                           .onChange(async (value) => {
+                                this.plugin.settings.blogs[index].gitPushBranch = value;
+                                await this.plugin.saveSettings();
+                            });
+                    });
+            }
+
+            new Setting(blogDiv)
+               .setName('启用文件夹匹配')
+               .setDesc('删除目标文件夹中不存在于源文件夹的文件')
+               .addToggle(toggle => {
+                    toggle.setValue(blog.enableFolderMatching)
+                       .onChange(async (value) => {
+                            this.plugin.settings.blogs[index].enableFolderMatching = value;
+                            await this.plugin.saveSettings();
+                        });
+                });
+
+            new Setting(blogDiv)
+               .setName("自动添加slug")
+               .setDesc("根据标题自动生成slug")
+               .addToggle(toggle => {
+                    toggle.setValue(blog.autoSlug)
+                       .onChange(async (value) => {
+                            this.plugin.settings.blogs[index].autoSlug = value;
+                            await this.plugin.saveSettings();
+                            this.display();
+                        });
+                });
+
+            if (blog.autoSlug) {
+                new Setting(blogDiv)
+                   .setName("slug前缀")
+                   .addText(text => {
+                        text.setPlaceholder('例如: post')
+                           .setValue(blog.slugPrefix)
+                           .onChange(async (value) => {
+                                this.plugin.settings.blogs[index].slugPrefix = value;
+                                await this.plugin.saveSettings();
+                            });
+                    });
+
+                new Setting(blogDiv)
+                   .setName("slug后缀")
+                   .addText(text => {
+                        text.setPlaceholder('例如: 2023')
+                           .setValue(blog.slugSuffix)
+                           .onChange(async (value) => {
+                                this.plugin.settings.blogs[index].slugSuffix = value;
+                                await this.plugin.saveSettings();
+                            });
+                    });
+
+                new Setting(blogDiv)
+                   .setName("slug分隔符")
+                   .addDropdown(dropdown => {
+                        dropdown.addOption("-", "连字符 (-)");
+                        dropdown.addOption("_", "下划线 (_)");
+                        dropdown.setValue(blog.slugSeparator)
+                           .onChange(async (value) => {
+                                this.plugin.settings.blogs[index].slugSeparator = value;
+                                await this.plugin.saveSettings();
+                            });
+                    });
+            }
+        });
     }
 }
+    
